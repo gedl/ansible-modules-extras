@@ -25,6 +25,13 @@ from lxml import etree
 import os
 import hashlib
 import sys
+from urlparse import urlparse
+try:
+    from boto.s3.key import Key
+    from boto.s3.connection import S3Connection
+    HAS_BOTO = True
+except ImportError:
+    HAS_BOTO = False
 
 DOCUMENTATION = '''
 ---
@@ -39,6 +46,7 @@ author: "Chris Schmidt (@chrisisbeef)"
 requirements:
     - "python >= 2.6"
     - lxml
+    - boto if using an S3 repository (s3://...)
 options:
     group_id:
         description:
@@ -65,19 +73,21 @@ options:
         default: jar
     repository_url:
         description:
-            - The URL of the Maven Repository to download from
+            - The URL of the Maven Repository to download from. Use s3://... if the repository is hosted on Amazon S3
         required: false
         default: http://repo1.maven.org/maven2
     username:
         description:
-            - The username to authenticate as to the Maven Repository
+            - The username to authenticate as to the Maven Repository. Use AWS secret key of the repository is hosted on S3
         required: false
         default: null
+        aliases: [ "aws_secret_key" ]
     password:
         description:
-            - The password to authenticate with to the Maven Repository
+            - The password to authenticate with to the Maven Repository. Use AWS secret access key of the repository is hosted on S3
         required: false
         default: null
+        aliases: [ "aws_secret_access_key" ]
     dest:
         description:
             - The path where the artifact should be written to
@@ -197,7 +207,6 @@ class MavenDownloader:
     def find_uri_for_artifact(self, artifact):
         if artifact.version == "latest":
             artifact.version = self._find_latest_version_available(artifact)
-
         if artifact.is_snapshot():
             path = "/%s/maven-metadata.xml" % (artifact.path())
             xml = self._request(self.base + path, "Failed to download maven-metadata.xml", lambda r: etree.parse(r))
@@ -218,14 +227,25 @@ class MavenDownloader:
         return self.base + "/" + artifact.path() + "/" + artifact.artifact_id + "-" + version + "." + artifact.extension
 
     def _request(self, url, failmsg, f):
+        url_to_use = url
+        parsed_url = urlparse.urlparse(url)
+        if parsed_url.scheme=='s3':
+                parsed_url = urlparse.urlparse(url)
+                bucket_name = parsed_url.netloc[:parsed_url.netloc.find('.')]
+                key_name = parsed_url.path
+                conn = S3Connection(aws_access_key_id=self.module.params.get('username', ''), aws_secret_access_key=self.module.params.get('password', ''))
+                bucket = conn.get_bucket(bucket_name)
+                key = Key(bucket,key_name)
+                url_to_use = key.generate_url(10)
+
         # Hack to add parameters in the way that fetch_url expects
         self.module.params['url_username'] = self.module.params.get('username', '')
         self.module.params['url_password'] = self.module.params.get('password', '')
         self.module.params['http_agent'] = self.module.params.get('user_agent', None)
 
-        response, info = fetch_url(self.module, url)
+        response, info = fetch_url(self.module, url_to_use)
         if info['status'] != 200:
-            raise ValueError(failmsg + " because of " + info['msg'] + "for URL " + url)
+            raise ValueError(failmsg + " because of " + info['msg'] + "for URL " + url_to_use)
         else:
             return f(response)
 
@@ -301,13 +321,19 @@ def main():
             classifier = dict(default=None),
             extension = dict(default='jar'),
             repository_url = dict(default=None),
-            username = dict(default=None),
-            password = dict(default=None, no_log=True),
+            username = dict(default=None,aliases=['aws_secret_key']),
+            password = dict(default=None, no_log=True,aliases=['aws_secret_access_key']),
             state = dict(default="present", choices=["present","absent"]), # TODO - Implement a "latest" state
             dest = dict(type="path", default=None),
             validate_certs = dict(required=False, default=True, type='bool'),
         )
     )
+
+
+    parsed_url = urlparse.urlparse(module.params["repository_url"])
+
+    if parsed_url.scheme=='s3' and not HAS_BOTO:
+        module.fail_json(msg='boto required for this module')
 
     group_id = module.params["group_id"]
     artifact_id = module.params["artifact_id"]
@@ -332,6 +358,7 @@ def main():
         module.fail_json(msg=e.args[0])
 
     prev_state = "absent"
+
     if os.path.isdir(dest):
         dest = dest + "/" + artifact_id + "-" + version + "." + extension
     if os.path.lexists(dest) and downloader.verify_md5(dest, downloader.find_uri_for_artifact(artifact) + '.md5'):
