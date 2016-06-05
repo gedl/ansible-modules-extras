@@ -28,7 +28,6 @@ import sys
 import posixpath
 from ansible.module_utils.basic import *
 from ansible.module_utils.urls import *
-from urlparse import urlparse
 try:
     import boto3
     HAS_BOTO = True
